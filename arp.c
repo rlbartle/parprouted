@@ -119,8 +119,8 @@ void arp_reply(ether_arp_frame *reqframe, struct sockaddr_ll *ifs)
 			syslog(LOG_ERR, "%s() error: %s %s for %d: %s", __FUNCTION__, "ioctl", "SIOCGIFNAME",
 					ifs->sll_ifindex, strerror(errno));
 		} else {
-			char *str = strdup(inet_ntoa(sia)); 
-			printf("Replying to %s(%s) faking %s\n", str, ifr.ifr_name, inet_ntoa(dia));
+			char *str = strdup(inet_ntoa(dia)); 
+			printf("Replying to %s(%s) faking %s\n", str, ifr.ifr_name, inet_ntoa(sia));
 			free(str);
 		}
 	}
@@ -219,6 +219,7 @@ void refresharp(ARPTAB_ENTRY *list)
 		printf("Refreshing ARP entries.\n");
 
 	while (list != NULL) {
+		list->removed_due_to_conflict = false;
 		arp_req(list->ifname, list->ipaddr_ia, 0);
 		list = list->next;
 	}
@@ -429,7 +430,7 @@ void *arp(char *ifname)
 				}
 
 				k_arpreq.arp_ha.sa_family = ARPHRD_ETHER;
-				memcpy(k_arpreq.arp_ha.sa_data, frame.arp.arp_sha, sizeof(frame.arp.arp_sha));
+				memcpy(k_arpreq.arp_ha.sa_data, frame.arp.arp_sha, ETH_ALEN);
 				k_arpreq.arp_flags = ATF_COM;
 				if (option_arpperm)
 					k_arpreq.arp_flags = k_arpreq.arp_flags | ATF_PERM;
@@ -472,9 +473,11 @@ void *arp(char *ifname)
 		sia.s_addr = src;
 
 		if (debug)
-			printf("Received ARP request for %s on iface %s\n", inet_ntoa(dia), ifname);
+			printf("Received ARP request for %s on iface %s from sender %.2X:%.2X:%.2X:%.2X:%.2X:%.2X\n", inet_ntoa(dia), ifname, frame.arp.arp_sha[0], frame.arp.arp_sha[1], frame.arp.arp_sha[2], frame.arp.arp_sha[3], frame.arp.arp_sha[4], frame.arp.arp_sha[5]);
 
-		if (memcmp(&dia,&sia,sizeof(dia)) && dia.s_addr != 0) {
+		if (memcmp(ifs.sll_addr, frame.arp.arp_sha, ETH_ALEN) == 0) {
+			if (debug) printf("Ignoring ARP request which has the iface mac address as the sender\n");
+		} else if (memcmp(&dia, &sia, sizeof(dia)) && dia.s_addr != 0) {
 			pthread_mutex_lock(&arptab_mutex);
 			/* Relay the ARP request to all other interfaces */
 			for (i=0; i <= last_iface_idx; i++) {
