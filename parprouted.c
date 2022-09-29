@@ -18,6 +18,7 @@
  *
  */
 
+#include <getopt.h>
 #include "parprouted.h"
 
 char *progname;
@@ -362,36 +363,45 @@ void *main_thread()
 int main (int argc, char **argv)
 {
 	pid_t child_pid;
-	int i, help=1;
+	int i;
+	bool help = false, foreground = false;
 
 	progname = (char *) basename(argv[0]);
 
-	for (i = 1; i < argc; i++) {
-		if (!strcmp(argv[i],"-d")) {
-			debug=1;
-			help=0;
-		}
-		else if (!strcmp(argv[i],"-p")) {
-			option_arpperm=1;
-			help=0;
-		}
-		else if (!strcmp(argv[i],"-h") || !strcmp(argv[i],"--help")) {
-			break;
-		}
-		else {
-			ifaces[++last_iface_idx]=argv[i];
-			help=0;
+	static struct option long_options[] = {
+		{ "debug", 0, 0, 'd' },
+		{ "foreground", 0, 0, 'f' },
+		{ "help", 0, 0, 0 },
+		{ "permanent", 0, 0, 'p' },
+		{ NULL, 0, 0, 0 },
+	};
+	for (int ch; (ch = getopt_long(argc, argv, "dfhp", long_options, NULL)) != -1 && !help;) {
+		switch (ch) {
+			case 'd':
+				debug=1;
+				//no break
+			case 'f':
+				foreground = true;
+				break;
+			case 'p':
+				option_arpperm=1;
+				break;
+			default:
+				help = true;
+				break;
 		}
 	}
+	if (optind < argc)
+		ifaces[++last_iface_idx] = argv[optind++];
 
 	if (help || last_iface_idx <= -1) {
 		printf("parprouted: proxy ARP routing daemon, version %s.\n", VERSION);
 		printf("(C) 2007 Vladimir Ivaschenko <vi@maks.net>, GPL2 license.\n");
-		printf("Usage: parprouted [-d] [-p] interface [interface]\n");
+		printf("Usage: parprouted [--debug -d] [--foreground -f] [--permanent -p] interfaces ...\n");
 		exit(0);
 	}
 
-	if (!debug) {
+	if (!foreground) {
 		/* fork to go into the background */
 		if ((child_pid = fork()) < 0) {
 			fprintf(stderr, "could not fork(): %s", strerror(errno));

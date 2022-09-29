@@ -27,7 +27,7 @@
 #define MAX_IFACES 10
 #define MAX_RQ_SIZE 50	/* maximum size of request queue */
 
-#define VERSION "0.7"
+#define VERSION "1.0"
 
 #include <errno.h>
 #include <fcntl.h>
