@@ -391,7 +391,7 @@ int main (int argc, char **argv)
 				break;
 		}
 	}
-	if (optind < argc)
+	while (optind < argc)
 		ifaces[++last_iface_idx] = argv[optind++];
 
 	if (help || last_iface_idx <= -1) {
