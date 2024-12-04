@@ -448,6 +448,7 @@ int main (int argc, char **argv)
 	pthread_mutex_init(&arptab_mutex, NULL);
 	pthread_mutex_init(&req_queue_mutex, NULL);
 
+	sleep(3);
 	if (pthread_create(&my_threads[++last_thread_idx], NULL, main_thread, NULL)) {
 		syslog(LOG_ERR, "Error creating main thread.");
 		abort();
