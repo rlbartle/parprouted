@@ -25,7 +25,7 @@
 #define SLEEPTIME 1000000 /* microseconds */
 #define REFRESHTIME 50 /* seconds */
 #define MAX_IFACES 10
-#define MAX_RQ_SIZE 50	/* maximum size of request queue */
+#define MAX_RQ_SIZE 256	/* maximum size of request queue */
 
 #define VERSION "1.0"
 
