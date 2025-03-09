@@ -19,13 +19,16 @@
  */
 
 #include <getopt.h>
+#include <linux/if.h>
+#include <ifaddrs.h>
 #include "parprouted.h"
 
 char *progname;
-int debug=0;
-int verbose=0;
-int option_arpperm=0;
-int perform_shutdown=0;
+bool debug = false;
+bool verbose = false;
+bool option_arpperm = false;
+bool sync_addresses = false;
+bool perform_shutdown = false;
 int exit_code = EXIT_SUCCESS;
 
 pthread_t my_threads[MAX_IFACES+1];
@@ -34,6 +37,15 @@ int last_thread_idx=-1;
 char * ifaces[MAX_IFACES];
 char iface_addrs[MAX_IFACES][ETH_ALEN];
 int last_iface_idx=-1;
+
+typedef struct iptab_entry {
+	struct in_addr ipaddr_ia;
+	struct in_addr ipaddr_ba;
+	char ifname[IFNAMSIZ];
+	struct iptab_entry *next;
+} IPTAB_ENTRY;
+
+IPTAB_ENTRY **iptab;
 
 ARPTAB_ENTRY **arptab;
 pthread_mutex_t arptab_mutex;
@@ -49,7 +61,10 @@ ARPTAB_ENTRY * replace_entry(struct in_addr ipaddr, char *dev)
 	}
 
 	if (cur_entry == NULL) {
-		if (debug) printf("Creating new ARP table entry %s(%s)\n", inet_ntoa(ipaddr), dev);
+		if (debug) {
+			printf("Creating new ARP table entry %s(%s)\n", 
+					inet_ntop(AF_INET, &ipaddr, NTOP_BUFFER_PARAMS), dev);
+		}
 
 		if ((cur_entry = (ARPTAB_ENTRY *) calloc(1, sizeof(ARPTAB_ENTRY))) == NULL) {
 			syslog(LOG_INFO, "No memory: %s", strerror(errno));
@@ -83,7 +98,11 @@ int remove_other_routes(ARPTAB_ENTRY * entry)
 	bool conflicted = false;
 	for (other_entry=*arptab; other_entry != NULL; other_entry = other_entry->next) {
 		if (entry != other_entry && entry->ipaddr_ia.s_addr == other_entry->ipaddr_ia.s_addr) {
-			if (debug) printf("Marking entry %s(%s) for removal %s\n", inet_ntoa(other_entry->ipaddr_ia), other_entry->ifname, other_entry->want_route ? "want_route" : "");
+			if (debug) {
+				printf("Marking entry %s(%s) for removal %s\n", 
+						inet_ntop(AF_INET, &other_entry->ipaddr_ia, NTOP_BUFFER_PARAMS),
+						other_entry->ifname, other_entry->want_route ? "want_route" : "");
+			}
 			other_entry->want_route = 0;
 			++removed;
 			conflicted |= !other_entry->incomplete;
@@ -92,79 +111,264 @@ int remove_other_routes(ARPTAB_ENTRY * entry)
 	}
 	if (conflicted) {
 		if (!entry->removed_due_to_conflict) {
-			//Reset to false again in refresharp()
-			if (debug) printf("ARP entry %s(%s) had conflicting entries\n", inet_ntoa(entry->ipaddr_ia), entry->ifname);
+			//Reset to false again when refreshed (after REFRESHTIME)
+			if (debug) {
+				printf("ARP entry %s(%s) had conflicting entries\n", 
+						inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS) , entry->ifname);
+			}
 			entry->removed_due_to_conflict = true;
 		} else {
 			//If the address is found on multiple network interfaces then running parprouted can result in chaos,
 			//so it is better to exit instead.
-			syslog(LOG_ERR, "Exiting due to potential clash with %s(%s)", inet_ntoa(entry->ipaddr_ia), entry->ifname);
+			syslog(LOG_ERR, "Exiting due to potential clash with %s(%s)", 
+					inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS), entry->ifname);
 			exit_code = EXIT_FAILURE;
-			perform_shutdown=1;
+			perform_shutdown = true;
 		}
 	}
 	return removed;
 }
 
-
 /* Remove route from kernel */
-bool route_remove(ARPTAB_ENTRY* cur_entry)
+bool route_remove(ARPTAB_ENTRY* entry)
 {
 	char routecmd_str[ROUTE_CMD_LEN];
 	bool success = false;
 
 	if (snprintf(routecmd_str, ROUTE_CMD_LEN-1,
 			"/sbin/ip route del %s/32 metric 50 dev %s scope link",
-			inet_ntoa(cur_entry->ipaddr_ia), cur_entry->ifname) <= ROUTE_CMD_LEN-1) {
+			inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS), entry->ifname) <= ROUTE_CMD_LEN-1) {
 		if (system(routecmd_str) != 0) {
 			syslog(LOG_INFO, "'%s' unsuccessful!", routecmd_str);
-			if (debug) printf("%s failed\n", routecmd_str);
 		} else {
 			if (debug) printf("%s success\n", routecmd_str);
 			success = true;
-			cur_entry->route_added = false;
+			entry->route_added = false;
 		}
 	}
 	return success;
 }
 
 /* Add route into kernel */
-bool route_add(ARPTAB_ENTRY* cur_entry)
+bool route_add(ARPTAB_ENTRY* entry)
 {
 	char routecmd_str[ROUTE_CMD_LEN];
 	bool success = false;
 
 	if (snprintf(routecmd_str, ROUTE_CMD_LEN-1,
 			"/sbin/ip route add %s/32 metric 50 dev %s scope link",
-			inet_ntoa(cur_entry->ipaddr_ia), cur_entry->ifname) <= ROUTE_CMD_LEN-1) {
+			inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS), entry->ifname) <= ROUTE_CMD_LEN-1) {
 		if (system(routecmd_str) != 0) {
 			syslog(LOG_INFO, "'%s' unsuccessful, will try to remove!", routecmd_str);
-			if (debug) printf("%s failed\n", routecmd_str);
-			route_remove(cur_entry);
+			route_remove(entry);
 		} else {
 			if (debug) printf("%s success\n", routecmd_str);
 			success = true;
-			cur_entry->route_added = true;
+			entry->route_added = true;
 		}
 	}
 	return success;
 }
 
-void processarp(int in_cleanup) 
+/* Checks that the expected route is indeed registered with the kernel */
+void route_check(ARPTAB_ENTRY* entry) {
+	/*
+	// /sbin/ip route show 192.168.12.194 dev eth0.2290 2>/dev/null | wc -l
+	char routecmd_str[ROUTE_CMD_LEN];
+	if (entry->route_added && snprintf(routecmd_str, ROUTE_CMD_LEN-1, "/sbin/ip route show %s dev %s",
+			inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS), entry->ifname) <= ROUTE_CMD_LEN-1) {
+		if (system(routecmd_str) != 0) {
+			syslog(LOG_INFO, "'%s' unsuccessful!", routecmd_str);
+			entry->route_added = false;
+		} else if (debug) {
+			printf("%s success\n", routecmd_str);
+		}
+	}
+	*/
+
+	int fd;
+	if ((fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)) < 0) {
+		syslog(LOG_ERR, "%s() error: %s %s for %s: %s", __FUNCTION__, "socket", "",
+				entry->ifname, strerror(errno));
+	} else {
+		struct sockaddr_in addr;
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(80);
+		addr.sin_addr.s_addr = entry->ipaddr_ia.s_addr;
+		if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+			syslog(LOG_INFO, "Route to %s(%s) is not available: %s", 
+					inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS),
+					entry->ifname, strerror(errno));
+			entry->route_added = false;
+		} else {
+			socklen_t addrlen = sizeof(addr);
+			if (getsockname(fd, (struct sockaddr *)&addr, &addrlen) == 0 && addr.sin_addr.s_addr != 0) {
+				if (debug) {
+					printf("Route to %s(%s) is available from %s\n", 
+							inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS), entry->ifname,
+							inet_ntop(AF_INET, &addr.sin_addr, NTOP_BUFFER_PARAMS));
+				}
+			} else {
+				syslog(LOG_INFO, "Couldn't get local address providing route to %s(%s)", 
+						inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS), entry->ifname);
+				entry->route_added = false;
+			}
+		}
+		close(fd);
+	}
+}
+
+bool address_remove(IPTAB_ENTRY* entry) {
+	char addresscmd_str[ROUTE_CMD_LEN];
+	bool success = false;
+
+	if (snprintf(addresscmd_str, ROUTE_CMD_LEN-1,
+			"/sbin/ip addr del %s/32 dev %s",
+			inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS),
+			entry->ifname) <= ROUTE_CMD_LEN-1) {
+		if (system(addresscmd_str) != 0) {
+			syslog(LOG_INFO, "'%s' unsuccessful!", addresscmd_str);
+		} else {
+			if (debug) printf("%s success\n", addresscmd_str);
+			success = true;
+			entry->ipaddr_ia.s_addr = 0;
+		}
+	}
+	return success;
+}
+
+bool address_add(IPTAB_ENTRY* entry) {
+	char addresscmd_str[ROUTE_CMD_LEN];
+	bool success = false;
+
+	if (snprintf(addresscmd_str, ROUTE_CMD_LEN-1,
+			"/sbin/ip addr add %s/32 broadcast %s dev %s",
+			inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS),
+			inet_ntop(AF_INET, &entry->ipaddr_ba, NTOP_BUFFER_PARAMS),
+			entry->ifname) <= ROUTE_CMD_LEN-1) {
+		if (system(addresscmd_str) != 0) {
+			// RTNETLINK answers: File exists
+			// Determine if address already exists.. and return success if so..
+			syslog(LOG_INFO, "'%s' unsuccessful!", addresscmd_str);
+			entry->ipaddr_ia.s_addr = 0;
+		} else {
+			if (debug) printf("%s success\n", addresscmd_str);
+			success = true;
+		}
+	}
+	return success;
+}
+
+void process_ip_addr_sync(bool in_cleanup) {
+	static u_int8_t call_counter = 0;
+	IPTAB_ENTRY *primary_entry = *iptab, *entry = NULL;
+	struct ifaddrs *ifap, *ifp;
+	if (primary_entry == NULL) {
+		syslog(LOG_INFO, "ip entries not set up!");
+		abort();
+	}
+
+	/* Fill the primary interface entry with the appropriate ip and broadcast addresses */
+	if (!in_cleanup && (++call_counter >= 50 || primary_entry->ipaddr_ia.s_addr == 0 || primary_entry->ipaddr_ba.s_addr == 0) &&
+			getifaddrs(&ifap) == 0) {
+		call_counter = 0;
+
+		for (entry = primary_entry; entry != NULL; entry = entry->next) {
+			for (ifp = ifap; ifp != NULL; ifp = ifp->ifa_next) {
+				if ((ifp->ifa_flags & (IFF_BROADCAST | IFF_MULTICAST | IFF_UP | IFF_LOOPBACK)) == (IFF_BROADCAST | IFF_MULTICAST | IFF_UP) &&
+						ifp->ifa_addr && ifp->ifa_addr->sa_family == AF_INET && ifp->ifa_name) {
+					if (strcmp(ifp->ifa_name, entry->ifname) == 0) {
+						break;
+					}							
+				}
+			}
+			if (ifp) {
+				if (entry == primary_entry) {
+					entry->ipaddr_ia.s_addr = ((struct sockaddr_in*)ifp->ifa_addr)->sin_addr.s_addr;
+					entry->ipaddr_ba.s_addr = ((struct sockaddr_in*)ifp->ifa_ifu.ifu_broadaddr)->sin_addr.s_addr;
+					if (debug) {
+						printf("Using %s(%s) as the primary ip address for sync\n",
+								inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS), entry->ifname);
+					}
+				} else if (entry->ipaddr_ia.s_addr != 0 && entry->ipaddr_ia.s_addr != ((struct sockaddr_in*)ifp->ifa_addr)->sin_addr.s_addr) {
+					// In case of multiple ip addresses on the interface..
+					for (ifp = ifp->ifa_next; ifp != NULL; ifp = ifp->ifa_next) {
+						if ((ifp->ifa_flags & (IFF_BROADCAST | IFF_MULTICAST | IFF_UP | IFF_LOOPBACK)) == (IFF_BROADCAST | IFF_MULTICAST | IFF_UP) &&
+								ifp->ifa_addr && ifp->ifa_addr->sa_family == AF_INET && ifp->ifa_name) {
+							if (strcmp(ifp->ifa_name, entry->ifname) == 0 && 
+									entry->ipaddr_ia.s_addr == ((struct sockaddr_in*)ifp->ifa_addr)->sin_addr.s_addr) {
+								break;
+							}							
+						}
+					}
+				} else if (entry->ipaddr_ia.s_addr == 0) {
+					//Check if the secondary interface already has the ip address of the primary interface set up..
+					for (; ifp != NULL; ifp = ifp->ifa_next) {
+						if ((ifp->ifa_flags & (IFF_BROADCAST | IFF_MULTICAST | IFF_UP | IFF_LOOPBACK)) == (IFF_BROADCAST | IFF_MULTICAST | IFF_UP) &&
+								ifp->ifa_addr && ifp->ifa_addr->sa_family == AF_INET && ifp->ifa_name && strcmp(ifp->ifa_name, entry->ifname) == 0) {
+							if (primary_entry->ipaddr_ia.s_addr == ((struct sockaddr_in*)ifp->ifa_addr)->sin_addr.s_addr) {
+								entry->ipaddr_ia.s_addr = ((struct sockaddr_in*)ifp->ifa_addr)->sin_addr.s_addr;
+								entry->ipaddr_ba.s_addr = ((struct sockaddr_in*)ifp->ifa_ifu.ifu_broadaddr)->sin_addr.s_addr;
+								if (debug && verbose) {
+									printf("Sync for %s not necessary since ip address %s is already assigned\n", entry->ifname,
+											inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS));
+								}
+								break;
+							}							
+						}
+					}
+				}
+			}
+			if (ifp == NULL && entry->ipaddr_ia.s_addr != 0) {
+				if (debug) {
+					printf("ip address no longer valid: %s(%s)\n",
+							inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS), entry->ifname);
+				}
+				entry->ipaddr_ia.s_addr = 0;
+			}
+		}
+		freeifaddrs(ifap);
+	}
+
+	/* Finally loop to sync all secondary interfaces */
+	for (entry = primary_entry->next; entry != NULL; entry = entry->next) {
+		if (entry->ipaddr_ia.s_addr != 0 && (in_cleanup || entry->ipaddr_ia.s_addr != primary_entry->ipaddr_ia.s_addr ||
+				entry->ipaddr_ba.s_addr != primary_entry->ipaddr_ba.s_addr)) {
+			address_remove(entry);
+		}
+
+		if (!in_cleanup && primary_entry->ipaddr_ia.s_addr != 0 && primary_entry->ipaddr_ba.s_addr != 0) {
+			if (entry->ipaddr_ia.s_addr != primary_entry->ipaddr_ia.s_addr || 
+					entry->ipaddr_ba.s_addr != primary_entry->ipaddr_ba.s_addr) {
+				entry->ipaddr_ia.s_addr = primary_entry->ipaddr_ia.s_addr;
+				entry->ipaddr_ba.s_addr = primary_entry->ipaddr_ba.s_addr;
+				address_add(entry);
+			}
+		}
+	}
+}
+
+void processarp(bool in_cleanup) 
 {
 	ARPTAB_ENTRY *cur_entry=*arptab, *prev_entry=NULL;
 
 	/* First loop to remove unwanted routes */
 	while (cur_entry != NULL) {
-		if (debug && verbose) printf("Working on ARP entry %s(%s) tstamp %u %s\n", inet_ntoa(cur_entry->ipaddr_ia), cur_entry->ifname, (int) cur_entry->tstamp, cur_entry->want_route ? "want_route" : "");
-
+		if (debug && verbose) {
+			printf("Working on ARP entry %s(%s) tstamp %u %s\n",
+					inet_ntop(AF_INET, &cur_entry->ipaddr_ia, NTOP_BUFFER_PARAMS),
+					cur_entry->ifname, (int) cur_entry->tstamp, cur_entry->want_route ? "want_route" : "");
+		}
 		if (!cur_entry->want_route || in_cleanup || time(NULL) - cur_entry->tstamp > ARP_TABLE_ENTRY_TIMEOUT) {
 
 			if (cur_entry->route_added)
 				route_remove(cur_entry);
 
 			/* remove from arp list */
-			if (debug) printf("Remove %sARP entry %s(%s)\n", cur_entry->incomplete ? "incomplete " : "", inet_ntoa(cur_entry->ipaddr_ia), cur_entry->ifname);
+			if (debug) {
+				printf("Remove %sARP entry %s(%s)\n", cur_entry->incomplete ? "incomplete " : "", 
+						inet_ntop(AF_INET, &cur_entry->ipaddr_ia, NTOP_BUFFER_PARAMS), cur_entry->ifname);
+			}
 			if (cur_entry->incomplete)
 				remove_arp(cur_entry->ipaddr_ia, cur_entry->ifname);
 			
@@ -211,7 +415,7 @@ void parseproc()
 
 	/* Parse /proc/net/arp table */
 
-	if ((arpf = fopen(PROC_ARP, "r")) == NULL)
+	if ((arpf = fopen(PROC_ARP, "re")) == NULL)
 		syslog(LOG_INFO, "Error during ARP table open: %s", strerror(errno));
 
 	while (!feof(arpf)) {
@@ -286,14 +490,19 @@ void parseproc()
 				syslog(LOG_INFO, "Error during ARP table parsing");
 
 			/* do not add routes for incomplete entries */
-			if (debug && entry->want_route != !incomplete)
-				printf("%s(%s): set want_route %d\n", inet_ntoa(entry->ipaddr_ia), entry->ifname, !incomplete);
+			if (debug && entry->want_route != !incomplete) {
+				printf("%s(%s): set want_route %d\n", 
+						inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS), entry->ifname, !incomplete);
+			}
 			entry->want_route = !incomplete;
 
 			/* Remove route from kernel if it already exists through a different interface */
 			if (entry->want_route) {
 				if (remove_other_routes(entry) > 0) {
-					if (debug) printf("Complete ARP entry for %s(%s) - entries via other interfaces removed\n", inet_ntoa(entry->ipaddr_ia), entry->ifname);
+					if (debug) {
+						printf("Complete ARP entry for %s(%s) - entries via other interfaces removed\n", 
+								inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS), entry->ifname);
+					}
 				}
 			}
 
@@ -301,7 +510,7 @@ void parseproc()
 
 			if (debug && !entry->route_added && entry->want_route) {
 				printf("ARP entry: '%s' HWAddr: '%s' Dev: '%s' !route_added want_route\n",
-						inet_ntoa(entry->ipaddr_ia), entry->hwaddr, entry->ifname);
+						inet_ntop(AF_INET, &entry->ipaddr_ia, NTOP_BUFFER_PARAMS), entry->hwaddr, entry->ifname);
 			}
 		}
 	}
@@ -317,19 +526,22 @@ void cleanup()
 //		pthread_cancel(my_threads[i]);
 //	}
 	pthread_mutex_trylock(&arptab_mutex);
-	processarp(1);
+	processarp(true);
+	if (sync_addresses) {
+		process_ip_addr_sync(true);
+	}
 	syslog(LOG_INFO, "Terminating.");
 	exit(exit_code);
 }
 
 void sighandler()
 {
-	perform_shutdown=1;
+	perform_shutdown = true;
 }
 
 void *main_thread()
 {
-	time_t last_refresh;
+	time_t last_refresh = 0, last_sync = 0;
 
 	signal(SIGINT, sighandler);
 	signal(SIGTERM, sighandler);
@@ -345,13 +557,24 @@ void *main_thread()
 		}
 		pthread_testcancel();
 		pthread_mutex_lock(&arptab_mutex);
+		if (sync_addresses && time(NULL)-last_sync > SYNCTIME) {
+			process_ip_addr_sync(false);
+			time(&last_sync);
+		}
 		parseproc();
-		processarp(0);
+		processarp(false);
 		pthread_mutex_unlock(&arptab_mutex);
 		usleep(SLEEPTIME);
 		if (!option_arpperm && time(NULL)-last_refresh > REFRESHTIME) {
 			pthread_mutex_lock(&arptab_mutex);
-			refresharp(*arptab);
+			if (debug)
+				printf("Refreshing ARP entries.\n");
+			for (ARPTAB_ENTRY *entry = *arptab; entry != NULL; entry = entry->next) {
+				if (sync_addresses)
+					route_check(entry);
+				entry->removed_due_to_conflict = false;
+				arp_req(entry->ifname, entry->ipaddr_ia, 0);
+			}
 			pthread_mutex_unlock(&arptab_mutex);
 			time(&last_refresh);
 		}
@@ -373,18 +596,22 @@ int main (int argc, char **argv)
 		{ "foreground", 0, 0, 'f' },
 		{ "help", 0, 0, 0 },
 		{ "permanent", 0, 0, 'p' },
+		{ "sync", 0, 0, 's' },
 		{ NULL, 0, 0, 0 },
 	};
-	for (int ch; (ch = getopt_long(argc, argv, "dfhp", long_options, NULL)) != -1 && !help;) {
+	for (int ch; (ch = getopt_long(argc, argv, "dfhps", long_options, NULL)) != -1 && !help;) {
 		switch (ch) {
 			case 'd':
-				debug=1;
+				debug = true;
 				// fall through
 			case 'f':
 				foreground = true;
 				break;
 			case 'p':
-				option_arpperm=1;
+				option_arpperm = true;
+				break;
+			case 's':
+				sync_addresses = true;
 				break;
 			default:
 				help = true;
@@ -397,7 +624,7 @@ int main (int argc, char **argv)
 	if (help || last_iface_idx <= -1) {
 		printf("parprouted: proxy ARP routing daemon, version %s.\n", VERSION);
 		printf("(C) 2007 Vladimir Ivaschenko <vi@maks.net>, GPL2 license.\n");
-		printf("Usage: parprouted [--debug -d] [--foreground -f] [--permanent -p] interfaces ...\n");
+		printf("Usage: parprouted [--debug -d] [--foreground -f] [--permanent -p] [--sync -s] interfaces ...\n");
 		exit(0);
 	}
 
@@ -444,6 +671,25 @@ int main (int argc, char **argv)
 	}
 
 	*arptab = NULL;
+	
+	if (sync_addresses) {
+		if ((iptab = (IPTAB_ENTRY **) malloc(sizeof(IPTAB_ENTRY **))) == NULL) {
+			syslog(LOG_INFO, "No memory: %s", strerror(errno));
+			abort();
+		}
+		*iptab = NULL;
+
+		IPTAB_ENTRY **entry = iptab;
+		for (i=0; i <= last_iface_idx; i++) {
+			if ((*entry = (IPTAB_ENTRY *) calloc(1, sizeof(IPTAB_ENTRY))) == NULL) {
+				syslog(LOG_INFO, "No memory: %s", strerror(errno));
+				abort();
+			}
+			strncpy((*entry)->ifname, ifaces[i], IFNAMSIZ);
+			(*entry)->ifname[IFNAMSIZ-1] = 0;
+			entry = &(*entry)->next;
+		}
+	}
 
 	pthread_mutex_init(&arptab_mutex, NULL);
 	pthread_mutex_init(&req_queue_mutex, NULL);
