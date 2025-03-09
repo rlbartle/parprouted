@@ -24,11 +24,13 @@
 #define ROUTE_CMD_LEN 255
 #define SLEEPTIME 1000000 /* microseconds */
 #define REFRESHTIME 50 /* seconds */
+#define SYNCTIME 30 /* seconds */
 #define MAX_IFACES 10
-#define MAX_RQ_SIZE 256	/* maximum size of request queue */
-
+#define MAX_RQ_SIZE 64	/* maximum size of request queue */
+#define NTOP_BUFFER_PARAMS (char[INET_ADDRSTRLEN]){0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, INET_ADDRSTRLEN
 #define VERSION "1.0"
 
+#include <sys/types.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -62,11 +64,11 @@ typedef struct arptab_entry {
 	struct arptab_entry *next;
 } ARPTAB_ENTRY;
 
-extern int debug;
-extern int verbose;
-extern int perform_shutdown;
-
-extern int option_arpperm;
+extern bool debug;
+extern bool verbose;
+extern bool perform_shutdown;
+extern bool option_arpperm;
+extern bool sync_addresses;
 
 extern ARPTAB_ENTRY **arptab;
 extern pthread_mutex_t arptab_mutex;
@@ -77,9 +79,8 @@ extern char iface_addrs[MAX_IFACES][ETH_ALEN];
 extern int last_iface_idx;
 
 extern void *arp(char *ifname);
-extern void refresharp(ARPTAB_ENTRY *list);
 extern void arp_req(char *ifname, struct in_addr remaddr, int gratuitous);
 extern void remove_arp(struct in_addr ipaddr, const char* ifname);
 
 extern void parseproc();
-extern void processarp(int cleanup);
+extern void processarp(bool cleanup);
